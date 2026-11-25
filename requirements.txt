@@ -1,4 +1,6 @@
 langgraph
 python-dotenv
-
+langchain
 langchain_groq
+pydantic
+requests
