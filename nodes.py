@@ -2,7 +2,7 @@
 import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
+from create_pdf import generate_pdf
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 
@@ -230,7 +230,6 @@ def supervisor(state: TripState):
 # PLANNING AGENT
 # --------------------------------------------------
 
-
 def planning_node(state: TripState):
 
     print("Planning Agent Started!")
@@ -269,10 +268,25 @@ def planning_node(state: TripState):
             updates["weather_data"] = output
 
     # Get available data and limit results
-    flights = updates.get("available_flights", state.get("available_flights", []))
-    hotels = updates.get("available_hotels", state.get("available_hotels", []))
-    places = updates.get("tourist_places", state.get("tourist_places", []))
-    weather = updates.get("weather_data", state.get("weather_data", []))
+    flights = updates.get(
+        "available_flights",
+        state.get("available_flights", [])
+    )
+
+    hotels = updates.get(
+        "available_hotels",
+        state.get("available_hotels", [])
+    )
+
+    places = updates.get(
+        "tourist_places",
+        state.get("tourist_places", [])
+    )
+
+    weather = updates.get(
+        "weather_data",
+        state.get("weather_data", [])
+    )
 
     flights = flights[:5] if isinstance(flights, list) else flights
     hotels = hotels[:5] if isinstance(hotels, list) else hotels
@@ -280,6 +294,7 @@ def planning_node(state: TripState):
 
     # Flight selection
     if step == "flight_confirmation" and user_input:
+
         selected = select_flight(user_input, flights)
 
         if selected is None:
@@ -295,10 +310,12 @@ def planning_node(state: TripState):
 
     # Hotel selection
     elif step == "hotel_confirmation" and user_input:
+
         selected = None
 
         if user_input.isdigit() and isinstance(hotels, list):
             index = int(user_input) - 1
+
             if 0 <= index < len(hotels):
                 selected = hotels[index]
 
@@ -315,8 +332,12 @@ def planning_node(state: TripState):
 
     # Tourist place selection
     elif step == "places_confirmation" and user_input:
-        if user_input.lower() in {"none", "no", "nothing", "none of them"}:
+
+        if user_input.lower() in {
+            "none", "no", "nothing", "none of them"
+        }:
             selected_places = []
+
         else:
             selected_places = [
                 places[int(value.strip()) - 1]
@@ -331,12 +352,14 @@ def planning_node(state: TripState):
 
     # Additional requirements
     elif step == "additional_requirements" and user_input:
+
         updates["additional_requirements"] = (
             [] if user_input.lower() in {
                 "no", "nothing", "nothing else", "none", "no thanks"
             }
             else [user_input]
         )
+
         updates["planning_step"] = "weather"
         step = "weather"
 
@@ -371,6 +394,7 @@ def planning_node(state: TripState):
     Weather: {weather}
     """
 
+    # Keep recent conversation messages
     recent_messages = [
         msg for msg in state.get("messages", [])
         if not isinstance(msg, ToolMessage)
@@ -397,19 +421,38 @@ def planning_node(state: TripState):
 
     updates["messages"] = [response]
 
+    # Handle LLM response
     if response.tool_calls:
+
         updates["reply"] = ""
         updates["waiting_for_user"] = False
+
     else:
+
         updates["reply"] = response.content
-        updates["waiting_for_user"] = bool(response.content)
 
         if step == "flights":
+
             updates["planning_step"] = "flight_confirmation"
+            updates["waiting_for_user"] = True
+
         elif step == "hotels":
+
             updates["planning_step"] = "hotel_confirmation"
+            updates["waiting_for_user"] = True
+
         elif step == "places":
+
             updates["planning_step"] = "places_confirmation"
+            updates["waiting_for_user"] = True
+
+        elif step == "weather":
+
+            updates["planning_step"] = "completed"
+            updates["waiting_for_user"] = False
+
+    print("Planning Step:", updates.get("planning_step", step))
+    print("Waiting for User:", updates.get("waiting_for_user"))
 
     return updates
 
@@ -442,8 +485,6 @@ def route_supervisor(state: TripState):
 
 def route_planning(state: TripState):
 
-    print("Planning Routing!")
-
     messages = state.get("messages", [])
 
     if messages and getattr(messages[-1], "tool_calls", None):
@@ -455,7 +496,7 @@ def route_planning(state: TripState):
     if state.get("waiting_for_user", False):
         return "ask_user"
 
-    return END
+    return "generate_pdf"
 
 
 # --------------------------------------------------
@@ -482,3 +523,13 @@ def route_after_user(state: TripState):
         return "planning"
 
     return "supervisor"
+
+
+def pdf_node(state: TripState):
+    markdown_content = state.get("reply", "")
+
+    pdf_path = generate_pdf(markdown_content)
+
+    return {
+        "pdf_path": pdf_path
+    }

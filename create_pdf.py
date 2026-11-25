@@ -1,8 +1,8 @@
 
 import markdown
-from weasyprint import HTML
+from xhtml2pdf import pisa
 
-def generate_pdf(markdown_content: str):
+def generate_pdf(markdown_content):
 
     html_content = markdown.markdown(
         markdown_content,
@@ -14,9 +14,9 @@ def generate_pdf(markdown_content: str):
     <head>
         <style>
             body {{
-                font-family: Arial, sans-serif;
-                margin: 40px;
-                line-height: 1.6;
+                font-family: Helvetica;
+                margin: 30px;
+                line-height: 1.5;
             }}
             h1, h2, h3 {{
                 color: #1f3a5f;
@@ -26,11 +26,11 @@ def generate_pdf(markdown_content: str):
                 border-collapse: collapse;
             }}
             th, td {{
-                border: 1px solid #ddd;
+                border: 1px solid #999;
                 padding: 8px;
             }}
             th {{
-                background-color: #eee;
+                background-color: #eeeeee;
             }}
         </style>
     </head>
@@ -40,6 +40,32 @@ def generate_pdf(markdown_content: str):
     </html>
     """
 
-    HTML(string=html).write_pdf("trip_itinerary.pdf")
+    pdf_path = "trip_itinerary.pdf"
 
-    return "trip_itinerary.pdf"
+    with open(pdf_path, "wb") as file:
+        result = pisa.CreatePDF(html, dest=file)
+
+    if result.err:
+        raise Exception("PDF generation failed")
+
+    return pdf_path
+
+
+# sample = """
+# # TripPilot AI
+
+# ## Delhi Trip
+
+# - Duration: 3 Days
+# - Travelers: 2
+
+# ## Tourist Places
+
+# | Place | Description |
+# |---|---|
+# | India Gate | Historic monument |
+# | Red Fort | Historical fort |
+# """
+
+
+# generate_pdf(sample)
