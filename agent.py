@@ -47,9 +47,10 @@ builder.add_conditional_edges(
     "planning",
     route_planning,
     {
+        "planning": "planning",
         "planning_tools": "planning_tools",
         "ask_user": "ask_user",
-        "pdf_node":"pdf_node"
+        "pdf_node": "pdf_node"
     }
 )
 

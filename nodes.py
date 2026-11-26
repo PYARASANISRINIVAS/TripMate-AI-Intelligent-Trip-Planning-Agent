@@ -155,8 +155,13 @@ def supervisor(state: TripState):
         HumanMessage(content=user_input)
     ]
 
-    # Geolocation tool
-    response = llm_with_tools.invoke(messages)
+    available_tools = (
+    [geo_location]
+    if tool_call_counts.get("geo_location", 0) < MAX_TOOL_CALLS
+    else []
+)
+
+    response = llm.bind_tools(available_tools).invoke(messages)
 
     if response.tool_calls:
         print("Supervisor tool calling!")
@@ -229,6 +234,43 @@ def supervisor(state: TripState):
 # --------------------------------------------------
 # PLANNING AGENT
 # --------------------------------------------------
+def select_hotel(user_input, hotels):
+
+    response = llm.invoke([
+        SystemMessage(content="""
+        You are a hotel selection assistant.
+
+        Select the hotel that best matches the user's request.
+
+        The user may:
+        - Mention a hotel name.
+        - Ask for the cheapest hotel.
+        - Ask for the highest-rated hotel.
+        - Ask for a hotel near a particular location.
+        - Describe other preferences.
+
+        Return ONLY the option number from the available hotels.
+        If no suitable hotel can be identified, return NONE.
+        """),
+        HumanMessage(content=f"""
+        Available hotels:
+        {hotels}
+
+        User request:
+        {user_input}
+        """)
+    ])
+
+    result = response.content.strip()
+
+    if result.isdigit():
+        index = int(result) - 1
+
+        if 0 <= index < len(hotels):
+            return hotels[index]
+
+    return None
+
 
 def planning_node(state: TripState):
 
@@ -239,7 +281,10 @@ def planning_node(state: TripState):
 
     updates = {}
 
-    # Save tool results and count unique executions
+    # --------------------------------------------------
+    # 1. Process tool results
+    # --------------------------------------------------
+
     for message in state.get("messages", []):
 
         if not isinstance(message, ToolMessage):
@@ -248,12 +293,23 @@ def planning_node(state: TripState):
         message_id = message.tool_call_id or message.id
 
         if message_id not in counted_tool_messages:
+
             tool_call_counts[message.name] = (
                 tool_call_counts.get(message.name, 0) + 1
             )
+
             counted_tool_messages.add(message_id)
 
         output = parse_tool_output(message.content)
+
+        if (
+            getattr(message, "status", "success") == "error"
+            or output is None
+            or output == ""
+            or output == []
+            or output == {}
+        ):
+            output = []
 
         if message.name == "get_flights":
             updates["available_flights"] = output
@@ -267,7 +323,10 @@ def planning_node(state: TripState):
         elif message.name == "get_weather":
             updates["weather_data"] = output
 
-    # Get available data and limit results
+    # --------------------------------------------------
+    # 2. Retrieve available data
+    # --------------------------------------------------
+
     flights = updates.get(
         "available_flights",
         state.get("available_flights", [])
@@ -288,82 +347,221 @@ def planning_node(state: TripState):
         state.get("weather_data", [])
     )
 
-    flights = flights[:5] if isinstance(flights, list) else flights
-    hotels = hotels[:5] if isinstance(hotels, list) else hotels
-    places = places[:5] if isinstance(places, list) else places
+    flights = flights[:5] if isinstance(flights, list) else []
+    hotels = hotels[:5] if isinstance(hotels, list) else []
+    places = places[:5] if isinstance(places, list) else []
 
-    # Flight selection
-    if step == "flight_confirmation" and user_input:
+    # --------------------------------------------------
+    # 3. Handle user responses using the LLM
+    # --------------------------------------------------
 
-        selected = select_flight(user_input, flights)
+    confirmation_stages = {
+        "flight_confirmation": {
+            "data": flights,
+            "field": "selected_flight",
+            "next": "hotels"
+        },
+        "hotel_confirmation": {
+            "data": hotels,
+            "field": "selected_hotel",
+            "next": "places"
+        },
+        "places_confirmation": {
+            "data": places,
+            "field": "selected_places",
+            "next": "additional_requirements"
+        }
+    }
 
-        if selected is None:
+    if step in confirmation_stages and user_input:
+
+        config = confirmation_stages[step]
+
+        decision_prompt = f"""
+        You are an intelligent travel planning assistant.
+
+        Current planning stage:
+        {step}
+
+        Available options:
+        {config["data"]}
+
+        Previous selections:
+        Flights: {state.get("selected_flight")}
+        Hotels: {state.get("selected_hotel")}
+        Tourist places: {state.get("selected_places")}
+
+        User response:
+        {user_input}
+
+        Understand the user's intent from the complete context.
+
+        You must return ONLY valid JSON with these fields:
+
+        {{
+            "action": "select | skip | search_again | clarify | continue",
+            "selected_indexes": [],
+            "response": ""
+        }}
+
+        Interpret natural language without relying on fixed keywords
+        or predefined phrases.
+
+        Select the appropriate available options based on the user's
+        preferences, comparisons, names, descriptions and requirements.
+
+        Use zero-based indexes for selected options.
+
+        Never invent options or indexes.
+
+        If the user wants to postpone or move forward, identify that
+        intent and return the appropriate action.
+
+        If the user wants different options, return search_again.
+
+        If the user's intent is unclear, return clarify.
+
+        If the user wants more information about the current options,
+        return continue.
+
+        For tourist places, multiple selections are allowed.
+        For flights and hotels, select only one option.
+
+        The response must be natural and relevant to the conversation.
+        """
+
+        decision_response = llm.invoke([
+            SystemMessage(content=decision_prompt)
+        ])
+
+        try:
+            decision = json.loads(decision_response.content)
+
+        except (json.JSONDecodeError, TypeError):
             return {
                 **updates,
-                "reply": "Please enter a valid flight number or option number.",
+                "reply": decision_response.content,
                 "waiting_for_user": True
             }
 
-        updates["selected_flight"] = selected
-        updates["planning_step"] = "hotels"
-        step = "hotels"
+        action = decision.get("action")
+        indexes = decision.get("selected_indexes", [])
 
-    # Hotel selection
-    elif step == "hotel_confirmation" and user_input:
+        # User selected an option
+        if action == "select":
 
-        selected = None
-
-        if user_input.isdigit() and isinstance(hotels, list):
-            index = int(user_input) - 1
-
-            if 0 <= index < len(hotels):
-                selected = hotels[index]
-
-        if selected is None:
-            return {
-                **updates,
-                "reply": "Please enter a valid hotel option number.",
-                "waiting_for_user": True
-            }
-
-        updates["selected_hotel"] = selected
-        updates["planning_step"] = "places"
-        step = "places"
-
-    # Tourist place selection
-    elif step == "places_confirmation" and user_input:
-
-        if user_input.lower() in {
-            "none", "no", "nothing", "none of them"
-        }:
-            selected_places = []
-
-        else:
-            selected_places = [
-                places[int(value.strip()) - 1]
-                for value in user_input.split(",")
-                if value.strip().isdigit()
-                and 0 <= int(value.strip()) - 1 < len(places)
+            valid_indexes = [
+                i for i in indexes
+                if isinstance(i, int)
+                and 0 <= i < len(config["data"])
             ]
 
-        updates["selected_places"] = selected_places
-        updates["planning_step"] = "additional_requirements"
-        step = "additional_requirements"
+            if not valid_indexes:
 
-    # Additional requirements
-    elif step == "additional_requirements" and user_input:
+                return {
+                    **updates,
+                    "reply": decision.get("response", ""),
+                    "waiting_for_user": True
+                }
 
-        updates["additional_requirements"] = (
-            [] if user_input.lower() in {
-                "no", "nothing", "nothing else", "none", "no thanks"
+            selected = [
+                config["data"][i] for i in valid_indexes
+            ]
+
+            if step == "places_confirmation":
+                updates[config["field"]] = selected
+            else:
+                updates[config["field"]] = selected[0]
+
+            return {
+                **updates,
+                "reply": decision.get("response", ""),
+                "planning_step": config["next"],
+                "waiting_for_user": False
             }
-            else [user_input]
+
+        # User wants to skip the current selection
+        elif action == "skip":
+
+            return {
+                **updates,
+                "reply": decision.get("response", ""),
+                "planning_step": config["next"],
+                "waiting_for_user": False
+            }
+
+        # User wants another search
+        elif action == "search_again":
+
+            step = {
+                "flight_confirmation": "flights",
+                "hotel_confirmation": "hotels",
+                "places_confirmation": "places"
+            }[step]
+
+        # User needs clarification or more information
+        elif action in ["clarify", "continue"]:
+
+            return {
+                **updates,
+                "reply": decision.get("response", ""),
+                "waiting_for_user": True
+            }
+
+    # --------------------------------------------------
+    # 4. Check retry limits
+    # --------------------------------------------------
+
+    stage_config = {
+        "flights": (
+            "get_flights",
+            "hotels"
+        ),
+        "hotels": (
+            "get_hotel_list",
+            "places"
+        ),
+        "places": (
+            "get_tourist_places",
+            "weather"
+        ),
+        "weather": (
+            "get_weather",
+            "completed"
         )
+    }
 
-        updates["planning_step"] = "weather"
-        step = "weather"
+    stage_data = {
+        "flights": flights,
+        "hotels": hotels,
+        "places": places,
+        "weather": weather
+    }
 
-    # Build trip context
+    if step in stage_config:
+
+        tool_name, next_stage = stage_config[step]
+
+        if (
+            tool_call_counts.get(tool_name, 0) >= MAX_TOOL_CALLS
+            and not stage_data[step]
+        ):
+
+            return {
+                **updates,
+                "reply": (
+                    f"Unable to retrieve {step} after "
+                    f"{MAX_TOOL_CALLS} attempts. "
+                    "Let's continue with the next stage."
+                ),
+                "planning_step": next_stage,
+                "waiting_for_user": False
+            }
+
+    # --------------------------------------------------
+    # 5. Build trip context
+    # --------------------------------------------------
+
     trip_details = f"""
     Destination: {state.get('destination')}
     Country: {state.get('country')}
@@ -380,21 +578,23 @@ def planning_node(state: TripState):
     Current Stage: {step}
 
     Available Flights: {flights}
-    Selected Flight: {updates.get('selected_flight', state.get('selected_flight'))}
+    Selected Flight: {state.get('selected_flight')}
 
     Available Hotels: {hotels}
-    Selected Hotel: {updates.get('selected_hotel', state.get('selected_hotel'))}
+    Selected Hotel: {state.get('selected_hotel')}
 
     Tourist Places: {places}
-    Selected Places: {updates.get('selected_places', state.get('selected_places'))}
+    Selected Places: {state.get('selected_places')}
 
     Additional Requirements:
-    {updates.get('additional_requirements', state.get('additional_requirements'))}
+    {state.get('additional_requirements')}
 
     Weather: {weather}
+
+    Latest User Input:
+    {user_input}
     """
 
-    # Keep recent conversation messages
     recent_messages = [
         msg for msg in state.get("messages", [])
         if not isinstance(msg, ToolMessage)
@@ -407,21 +607,29 @@ def planning_node(state: TripState):
         *recent_messages
     ]
 
-    # Restrict tools based on their call counts
+    # --------------------------------------------------
+    # 6. Bind available tools
+    # --------------------------------------------------
+
     available_tools = [
         tool for tool in planning_tools
         if tool_call_counts.get(tool.name, 0) < MAX_TOOL_CALLS
     ]
 
-    llm_with_tools = planning_llm.bind_tools(available_tools)
-
     print("Tool call counts:", tool_call_counts)
+    print("Available tools:", [tool.name for tool in available_tools])
+
+    # Use the unbound base LLM here
+    llm_with_tools = llm.bind_tools(available_tools)
 
     response = llm_with_tools.invoke(messages)
 
     updates["messages"] = [response]
 
-    # Handle LLM response
+    # --------------------------------------------------
+    # 7. Handle tool calls and responses
+    # --------------------------------------------------
+
     if response.tool_calls:
 
         updates["reply"] = ""
@@ -431,30 +639,27 @@ def planning_node(state: TripState):
 
         updates["reply"] = response.content
 
-        if step == "flights":
+        next_stages = {
+            "flights": "flight_confirmation",
+            "hotels": "hotel_confirmation",
+            "places": "places_confirmation",
+            "weather": "completed"
+        }
 
-            updates["planning_step"] = "flight_confirmation"
-            updates["waiting_for_user"] = True
+        if step in next_stages:
 
-        elif step == "hotels":
+            updates["planning_step"] = next_stages[step]
 
-            updates["planning_step"] = "hotel_confirmation"
-            updates["waiting_for_user"] = True
-
-        elif step == "places":
-
-            updates["planning_step"] = "places_confirmation"
-            updates["waiting_for_user"] = True
-
-        elif step == "weather":
-
-            updates["planning_step"] = "completed"
-            updates["waiting_for_user"] = False
+            updates["waiting_for_user"] = (
+                step != "weather"
+            )
 
     print("Planning Step:", updates.get("planning_step", step))
     print("Waiting for User:", updates.get("waiting_for_user"))
 
     return updates
+
+
 
 
 # --------------------------------------------------
@@ -483,6 +688,7 @@ def route_supervisor(state: TripState):
 # PLANNING ROUTING
 # --------------------------------------------------
 
+
 def route_planning(state: TripState):
 
     messages = state.get("messages", [])
@@ -491,12 +697,13 @@ def route_planning(state: TripState):
         return "planning_tools"
 
     if state.get("planning_step") == "completed":
-        return "pdf"
+        return "pdf_node"
 
     if state.get("waiting_for_user", False):
         return "ask_user"
 
-    return "generate_pdf"
+    return "planning"
+
 
 
 # --------------------------------------------------

@@ -17,7 +17,7 @@ def geo_location(destination: str):
 
     params = {
         "name": destination,
-        "count": 10,
+        "count": 3,
         "language": "en",
         "format": "json"
     }
@@ -26,6 +26,9 @@ def geo_location(destination: str):
     response.raise_for_status()
 
     results = response.json().get("results", [])
+    print(results)
+    if not results:
+        return "No data found"
 
     return [
         {

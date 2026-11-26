@@ -6,7 +6,7 @@ from agent import graph
 
 config = {
     "configurable": {
-        "thread_id": "trip_002"
+        "thread_id": "trip_003"
     }
 }
 
